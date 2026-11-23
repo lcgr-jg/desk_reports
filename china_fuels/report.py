@@ -1,7 +1,7 @@
 """
-China fuels daily — SunSirs spot scorecard email.
+China fuels daily — SunSirs spots + JLC indie cracks email.
 
-Reads landing table from sibling oil_data_ingest (no scrape here).
+Reads landing tables from sibling oil_data_ingest (no scrape / no BBG here).
 
 Usage (from china_fuels/ or via run_daily.bat):
   python report.py --save-only
@@ -30,7 +30,11 @@ from sender import send_email  # noqa: E402
 DEFAULT_PRICES = (
     CODING / "oil_data_ingest" / "data" / "processed" / "sunsirs" / "prices.parquet"
 )
+DEFAULT_CRACKS = (
+    CODING / "oil_data_ingest" / "data" / "processed" / "jlc" / "cracks.parquet"
+)
 SAVE_DIR = HERE / "scratch"
+CRACK_PRODUCT_ORDER = ("gasoline", "diesel")
 
 # First weeks: you only. Add teammates later as a comma-separated list.
 RECIPIENTS = "luiscarlos.gaitan@jainglobal.com"
@@ -86,20 +90,36 @@ def load_prices(path: Path) -> pd.DataFrame:
     return df.sort_values(["product", "date"]).reset_index(drop=True)
 
 
-def scorecard(prices: pd.DataFrame) -> pd.DataFrame:
+def load_cracks(path: Path) -> pd.DataFrame:
+    """Optional — report still sends if cracks file is missing."""
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values(["product", "date"]).reset_index(drop=True)
+
+
+def _series_scorecard(
+    frame: pd.DataFrame,
+    *,
+    value_col: str,
+    unit_col: str,
+    product_order: tuple[str, ...],
+    default_unit: str,
+) -> pd.DataFrame:
     rows = []
-    for product, g in prices.groupby("product", sort=True):
+    for product, g in frame.groupby("product", sort=True):
         g = g.sort_values("date")
         last = g.iloc[-1]
-        level = float(last["price"])
-        prev = float(g.iloc[-2]["price"]) if len(g) >= 2 else float("nan")
-        week = float(g.iloc[-6]["price"]) if len(g) >= 6 else float("nan")
+        level = float(last[value_col])
+        prev = float(g.iloc[-2][value_col]) if len(g) >= 2 else float("nan")
+        week = float(g.iloc[-6][value_col]) if len(g) >= 6 else float("nan")
         rows.append(
             {
                 "product": product,
                 "as_of": last["date"],
                 "price": level,
-                "unit": last.get("unit", "RMB/mt"),
+                "unit": last.get(unit_col, default_unit) if unit_col in g.columns else default_unit,
                 "dod": level - prev if pd.notna(prev) else float("nan"),
                 "dod_pct": (level / prev - 1.0) * 100.0
                 if pd.notna(prev) and prev
@@ -111,11 +131,34 @@ def scorecard(prices: pd.DataFrame) -> pd.DataFrame:
             }
         )
     out = pd.DataFrame(rows)
-    # Stable desk order when present.
-    cat = pd.Categorical(out["product"], categories=list(PRODUCT_ORDER), ordered=True)
+    if out.empty:
+        return out
+    cat = pd.Categorical(out["product"], categories=list(product_order), ordered=True)
     out = out.assign(product=cat).sort_values("product").reset_index(drop=True)
     out["product"] = out["product"].astype(str)
     return out
+
+
+def scorecard(prices: pd.DataFrame) -> pd.DataFrame:
+    return _series_scorecard(
+        prices,
+        value_col="price",
+        unit_col="unit",
+        product_order=PRODUCT_ORDER,
+        default_unit="RMB/mt",
+    )
+
+
+def cracks_scorecard(cracks: pd.DataFrame) -> pd.DataFrame:
+    if cracks.empty:
+        return pd.DataFrame()
+    return _series_scorecard(
+        cracks,
+        value_col="value",
+        unit_col="unit",
+        product_order=CRACK_PRODUCT_ORDER,
+        default_unit="USD/bbl",
+    )
 
 
 def slate_spreads(prices: pd.DataFrame) -> pd.DataFrame:
@@ -283,6 +326,70 @@ def levels_figure(prices: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def cracks_figure(cracks: pd.DataFrame) -> go.Figure | None:
+    if cracks.empty:
+        return None
+    # Chart last ~90 sessions for readability even after a 1y backfill.
+    latest = cracks["date"].max()
+    window = cracks[cracks["date"] >= latest - pd.Timedelta(days=120)].copy()
+    fig = px.line(
+        window,
+        x="date",
+        y="value",
+        color="product",
+        markers=True,
+        category_orders={
+            "product": [p for p in CRACK_PRODUCT_ORDER if p in set(window["product"])]
+        },
+        title="JLC indie refinery cracks (USD/bbl)",
+        labels={"value": "USD/bbl", "date": "Date", "product": "Product"},
+    )
+    fig.update_layout(
+        legend_title_text="",
+        margin=dict(l=40, r=20, t=50, b=40),
+        template="plotly_white",
+    )
+    fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="#888")
+    return fig
+
+
+def cracks_html(sc: pd.DataFrame) -> str:
+    if sc.empty:
+        return (
+            "<p class=\"footnote\">JLC cracks landing table missing — "
+            "run <code>oil_data_ingest/scripts/fetch_jlc_cracks.py</code>.</p>"
+        )
+    rows = []
+    for r in sc.itertuples(index=False):
+        rows.append(
+            "<tr>"
+            f'<td class="left">{r.product}</td>'
+            f"<td>{pd.Timestamp(r.as_of).strftime('%Y-%m-%d')}</td>"
+            f"<td>{_fmt_num(r.price)}</td>"
+            f'<td class="{_delta_class(r.dod)}">{_fmt_num(r.dod, signed=True)}</td>'
+            f'<td class="{_delta_class(r.dod_pct)}">{_fmt_pct(r.dod_pct)}</td>'
+            f'<td class="{_delta_class(r.d5)}">{_fmt_num(r.d5, signed=True)}</td>'
+            f'<td class="{_delta_class(r.d5_pct)}">{_fmt_pct(r.d5_pct)}</td>'
+            "</tr>"
+        )
+    body = "\n".join(rows)
+    return f"""
+<table class="score">
+  <thead>
+    <tr>
+      <th class="left">Product</th><th>As of</th><th>USD/bbl</th>
+      <th>DoD</th><th>DoD %</th><th>5d</th><th>5d %</th>
+    </tr>
+  </thead>
+  <tbody>
+{body}
+  </tbody>
+</table>
+<p class="footnote">JLC via Bloomberg: ex-refinery price after tax − mainstream imported crude cost
+(CHPZIRGC / CHPZIRDC Index). Independent refineries, main imported grades.</p>
+"""
+
+
 def spreads_figure(prices: pd.DataFrame) -> go.Figure | None:
     wide = (
         prices.pivot_table(index="date", columns="product", values="price", aggfunc="last")
@@ -320,29 +427,36 @@ def spreads_figure(prices: pd.DataFrame) -> go.Figure | None:
     return fig
 
 
-def build_html(prices: pd.DataFrame, prices_path: Path) -> tuple[str, str]:
+def build_html(
+    prices: pd.DataFrame,
+    prices_path: Path,
+    cracks: pd.DataFrame,
+    cracks_path: Path,
+) -> tuple[str, str]:
     sc = scorecard(prices)
     sp = slate_spreads(prices)
+    csc = cracks_scorecard(cracks)
     as_of = pd.Timestamp(sc["as_of"].max()) if not sc.empty else pd.Timestamp.today()
     subject = f"China fuels spots | {as_of:%d %b %Y}"
 
+    img_levels = img_spreads = img_cracks = ""
+    chart_note = ""
     try:
         img_levels = fig_to_img_tag(levels_figure(prices))
         fig_sp = spreads_figure(prices)
         img_spreads = fig_to_img_tag(fig_sp) if fig_sp is not None else ""
-        chart_note = ""
+        fig_cr = cracks_figure(cracks)
+        img_cracks = fig_to_img_tag(fig_cr) if fig_cr is not None else ""
     except Exception as exc:  # kaleido / chrome headless can fail on some desktops
-        img_levels = ""
-        img_spreads = ""
         chart_note = f"<p class=\"footnote\">Charts skipped ({type(exc).__name__}: {exc}).</p>"
 
     body = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">{_EMAIL_CSS}</head><body>
-<h1>China fuel spots — SunSirs</h1>
+<h1>China fuel spots — SunSirs + JLC cracks</h1>
 <h2>Daily desk note &middot; data through {as_of:%d %b %Y}</h2>
 <p class="headline">{headline(sc)}</p>
 
-<h3>Scorecard</h3>
+<h3>SunSirs scorecard (RMB/mt)</h3>
 {scorecard_html(sc)}
 
 <hr class="divider" />
@@ -353,21 +467,33 @@ def build_html(prices: pd.DataFrame, prices_path: Path) -> tuple[str, str]:
 <h3>Slate spreads</h3>
 {spreads_html(sp)}
 <div class="section chart">{img_spreads}</div>
+
+<hr class="divider" />
+
+<h3>JLC indie refinery cracks (USD/bbl)</h3>
+{cracks_html(csc)}
+<div class="section chart">{img_cracks}</div>
 {chart_note}
 
-<p class="footnote">Source: SunSirs UK product pages via oil_data_ingest
-(<code>{prices_path}</code>). Report does not scrape.</p>
+<p class="footnote">Sources via oil_data_ingest (report does not scrape or call Bloomberg):
+SunSirs <code>{prices_path}</code>; JLC cracks <code>{cracks_path}</code>.</p>
 </body></html>"""
     return body, subject
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="China fuels SunSirs daily HTML report")
+    parser = argparse.ArgumentParser(description="China fuels daily HTML report")
     parser.add_argument(
         "--prices",
         type=Path,
         default=DEFAULT_PRICES,
         help="Path to sunsirs prices.parquet",
+    )
+    parser.add_argument(
+        "--cracks",
+        type=Path,
+        default=DEFAULT_CRACKS,
+        help="Path to jlc cracks.parquet",
     )
     parser.add_argument(
         "--save-only",
@@ -378,10 +504,13 @@ def main(argv: list[str] | None = None) -> int:
 
     _silence_loggers()
     prices_path = args.prices.resolve()
+    cracks_path = args.cracks.resolve()
     prices = load_prices(prices_path)
-    print(f"Loaded {len(prices)} rows from {prices_path}", flush=True)
+    cracks = load_cracks(cracks_path)
+    print(f"Loaded {len(prices)} spot rows from {prices_path}", flush=True)
+    print(f"Loaded {len(cracks)} crack rows from {cracks_path}", flush=True)
 
-    body, subject = build_html(prices, prices_path)
+    body, subject = build_html(prices, prices_path, cracks, cracks_path)
 
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
     as_of = pd.to_datetime(prices["date"]).max().strftime("%Y%m%d")

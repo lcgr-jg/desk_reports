@@ -16,7 +16,9 @@ desk_reports/
 
 ## China fuels (daily)
 
-Reads `../oil_data_ingest/data/processed/sunsirs/prices.parquet`.
+Reads from `oil_data_ingest`:
+- `data/processed/sunsirs/prices.parquet` (SunSirs spots)
+- `data/processed/jlc/cracks.parquet` (JLC indie cracks via Bloomberg)
 
 ```powershell
 cd desk_reports\china_fuels
